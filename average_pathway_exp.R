@@ -2,6 +2,7 @@ library(tidyverse)
 library(scales)
 library(ggrepel)
 
+# Cancer types, pathway gene lists and tumor staging information -------------
 projects <- c(
   c("TCGA-BRCA", "TCGA-COAD", "TCGA-HNSC", "TCGA-KIRC",
     "TCGA-KIRP", "TCGA-LUAD", "TCGA-STAD", "TCGA-THCA"),
@@ -9,6 +10,7 @@ projects <- c(
 )
 gene.list <- data.table::fread("~/storage/data/fenton/cleaned_gene_list.csv") %>%
   filter(str_detect(Pathway, "Fenton", negate = T)) %>%
+  mutate(Pathway = str_replace_all(Pathway, "[\\s/]", "_")) %>%
   select(-PathwayType)
 
 gene.mapping <- gene.list %>%
@@ -34,7 +36,30 @@ FPKMtoTPM <- function(x) {
   return(exp(log(x) - log(sum(x)) + log(1e6)))
 }
 
-res <- tibble()
+# Get DEA results for each cancer type and stage -----------------------------
+tumor.stages <- c("I", "II", "III", "IV")
+res.dea <- tibble()
+for (proj in projects) {
+  for (t.stage in tumor.stages) {
+    try(df <- data.table::fread(str_glue(
+      "~/storage/data/TCGA/DEA/csv/{proj}_{t.stage}_vs_N.csv"
+    )), silent = T)
+    try(df <- data.table::fread(str_glue(
+      "~/storage/data/TCGA/DEA/csv/all_stages_proj/{proj}_{t.stage}_vs_N.csv"
+    )), silent = T)
+    df <- df %>%
+      rename(Ensembl = V1) %>%
+      mutate(Ensembl = str_extract(Ensembl, "^[^.]+")) %>%
+      inner_join(gene.mapping, by = "Ensembl") %>%
+      filter(padj <= 0.01) %>%
+      arrange(-abs(log2FoldChange)) %>%
+      mutate(Project = proj, Stage = t.stage) %>%
+      select(Project, Stage, Symbol, log2FoldChange)
+    res.dea <- bind_rows(res.dea, df)
+  }
+}
+# Get TPMs -------------------------------------------------------------------
+res.exp <- tibble()
 for (proj in projects) {
   message(str_glue("Reading project {proj}."))
   df <- data.table::fread(
@@ -51,7 +76,7 @@ for (proj in projects) {
   # filter out lowly-expressed genes
   genes.to.keep <- df %>%
     group_by(Ensembl) %>%
-    filter(all(TPM >= 0.5)) %>%
+    filter(length(TPM >= 0.5) >= (ncol(df) / 2)) %>%
     distinct(Ensembl) %>%
     .$Ensembl
 
@@ -61,17 +86,23 @@ for (proj in projects) {
     summarise(MeanTPM = mean(TPM)) %>%
     left_join(gene.list, by = "Ensembl") %>%
     mutate(Project = proj)
-  res <- bind_rows(res, df)
+  res.exp <- bind_rows(res.exp, df)
 }
 
+res <- left_join(res.exp, res.dea, by = c("Project" = "Project",
+                                            "tumor_stage" = "Stage",
+                                            "Symbol" = "Symbol"))
+rm(res.exp, res.dea, df, genes.to.keep, t.stage, tumor.stages)
 pw.list <- unique(gene.list$Pathway)
 
+# Plot for each pathway ------------------------------------------------------
 for (pw in pw.list) {
   # Filter for genes that have harmonic expression across stages
   SigDiff <- res %>%
     filter(Pathway == pw) %>%
+    filter(!is.na(log2FoldChange)) %>%
     group_by(Project, Ensembl) %>%
-    summarise(DiffExp = (max(MeanTPM) - min(MeanTPM)) / mean(MeanTPM)) %>%
+    summarise(DiffExp = max(log2FoldChange) - min(log2FoldChange)) %>%
     ungroup() %>%
     filter(DiffExp >= quantile(DiffExp)[4]) %>%
     left_join(gene.mapping, by = "Ensembl") %>%
@@ -86,7 +117,7 @@ for (pw in pw.list) {
         ProjSymbol %in% SigDiff$ProjSymbol ~ "red",
         T ~ "grey"
       )) %>%
-    mutate(LineColor = factor(LineColor, levels = c("red", "grey"))) %>%
+    mutate(LineColor = factor(LineColor, levels = c("grey", "red"))) %>%
     ggplot(aes(x = tumor_stage, y = MeanTPM))+
     scale_y_continuous(trans = log2_trans(),
                        breaks = trans_breaks("log2", function(x) 2^x, n = 10),
@@ -97,13 +128,22 @@ for (pw in pw.list) {
     # Label genes in the right margin
     geom_label_repel(
       aes(
-        label = ifelse(tumor_stage == "IV", Symbol, ''),
+        label = ifelse((tumor_stage == "IV") & (LineColor == "red"), Symbol, ''),
         fill = Symbol
       ),
       fontface = 'bold', color = 'white',
       segment.color = 'grey50',
       direction = "y",
       xlim = c(4, 15)
+    )+
+    # Label log2 Fold Change for red ones
+    geom_text_repel(
+      aes(label = ifelse((LineColor == "red") & (!is.na(log2FoldChange)),
+                         round(log2FoldChange, 2), "")),
+      # segment.color = 'grey50',
+      size = 2,
+      colour = "#0392ce",
+      max.iter = 1000
     )+
     ggtitle(pw)+
     labs(
@@ -118,11 +158,11 @@ for (pw in pw.list) {
       panel.spacing = unit(1, "in"),
       plot.margin = unit(c(0, 1, 0, 0), units = "in")
     )+
-    scale_colour_manual(values=c("red", "gray80"))
+    scale_colour_manual(values=c("gray80", "red"))
 
   ggsave(p, file = str_glue(
-    "~/storage/data/metabolic_reprogramming/average_pathway_exp/plot/all_proj_in_pw/{pw}_small.png"),
-    device = "png", width = 15, height = 10,
+    "~/storage/data/metabolic_reprogramming/average_pathway_exp/plot/log2FC/{pw}.png"),
+    device = "png", width = 25, height = 15,
     units = "in", dpi = "retina")
 }
 
