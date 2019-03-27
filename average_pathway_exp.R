@@ -8,14 +8,44 @@ projects <- c(
     "TCGA-KIRP", "TCGA-LUAD", "TCGA-STAD", "TCGA-THCA"),
   c("TCGA-BLCA", "TCGA-ESCA", "TCGA-KICH", "TCGA-LIHC", "TCGA-LUSC")
 )
+
+# proteasomes <- data.table::fread(
+#   "~/storage/data/metabolic_reprogramming/proteasome.csv") %>%
+#   .$`Approved symbol`
+#
+# proteasomes <- data.table::fread("~/CSBL_shared/ID_mapping/Ensembl_symbol_entrez.csv") %>%
+#   filter(external_gene_name %in% proteasomes) %>%
+#   mutate(Pathway = "Proteasome") %>%
+#   select(Pathway, Symbol = external_gene_name, Ensembl = ensembl_gene_id)
+
 gene.list <- data.table::fread("~/storage/data/fenton/cleaned_gene_list.csv") %>%
   filter(str_detect(Pathway, "Fenton", negate = T)) %>%
   mutate(Pathway = str_replace_all(Pathway, "[\\s/]", "_")) %>%
   select(-PathwayType)
+# %>%  bind_rows(proteasomes)
 
 gene.mapping <- gene.list %>%
   select(-Pathway) %>%
   distinct()
+
+# https://seer.cancer.gov/csr/1975_2015/browse_csr.php?sectionSEL=1&pageSEL=sect_01_table.04
+# https://www.nature.com/articles/s41416-018-0140-8
+rel.survival <- data.table::fread(
+  "~/storage/data/metabolic_reprogramming/tcga_survival.csv"
+)
+colnames(rel.survival) <- c("Project", "TCGA", "SEER")
+rel.survival <- rel.survival %>%
+  mutate(
+    Project = str_glue("TCGA-{Project}"),
+    TCGA = str_extract(TCGA, "\\([\\d.]+"),
+    SEER = str_extract(SEER, "\\([\\d.]+")
+  ) %>%
+  mutate(
+    TCGA = as.numeric(str_remove(TCGA, "\\(")),
+    SEER = as.numeric(str_remove(SEER, "\\("))
+  ) %>%
+  filter(Project %in% projects) %>%
+  arrange(TCGA, SEER)
 
 clinical <- data.table::fread(
   "~/CSBL_shared/RNASeq/TCGA/annotation/counts_annotation.csv") %>%
@@ -89,11 +119,34 @@ for (proj in projects) {
   res.exp <- bind_rows(res.exp, df)
 }
 
-res <- left_join(res.exp, res.dea, by = c("Project" = "Project",
-                                            "tumor_stage" = "Stage",
-                                            "Symbol" = "Symbol"))
+res <- res.exp %>%
+  left_join(res.dea, by = c("Project" = "Project",
+                            "tumor_stage" = "Stage",
+                            "Symbol" = "Symbol")) %>%
+  mutate(Project = factor(Project, levels = rel.survival$Project))
 rm(res.exp, res.dea, df, genes.to.keep, t.stage, tumor.stages)
 pw.list <- unique(gene.list$Pathway)
+
+# Proteasome differential expression -----------------------------------------
+# pw.list <- pw.list[pw.list != "Proteasome"]
+# Proteasome.SigDiff <- res %>%
+#   filter(Pathway == "Proteasome") %>%
+#   filter(!is.na(log2FoldChange)) %>%
+#   group_by(Project, Ensembl) %>%
+#   summarise(DiffExp = max(log2FoldChange) - min(log2FoldChange)) %>%
+#   ungroup() %>%
+#   filter(DiffExp >= quantile(DiffExp)[4]) %>%
+#   left_join(gene.mapping, by = "Ensembl") %>%
+#   mutate(ProjSymbol = paste0(Project, "_", Symbol)) %>%
+#   distinct(ProjSymbol, .keep_all = T)
+# Proteasome.p <- res %>%
+#   filter(Pathway == "Proteasome") %>%
+#   mutate(
+#     ProjSymbol = paste0(Project, "_", Symbol),
+#     LineColor = case_when(
+#       ProjSymbol %in% Proteasome.SigDiff$ProjSymbol ~ "blue",
+#       T ~ "grey90"
+#     ))
 
 # Plot for each pathway ------------------------------------------------------
 for (pw in pw.list) {
@@ -116,19 +169,32 @@ for (pw in pw.list) {
       LineColor = case_when(
         ProjSymbol %in% SigDiff$ProjSymbol ~ "red",
         T ~ "grey"
+      ),
+      PointColor = case_when(
+        is.na(log2FoldChange) ~ "grey",
+        T ~ "red"
       )) %>%
-    mutate(LineColor = factor(LineColor, levels = c("grey", "red"))) %>%
+    # bind_rows(Proteasome.p) %>%
+    # mutate(LineColor = factor(LineColor,
+    #                           levels = c("grey", "red", "blue", "grey90"))) %>%
+    mutate(
+      LineColor = factor(LineColor,
+                         levels = c("grey", "red")),
+      PointColor= factor(PointColor,
+                         levels = c("grey", "red"))) %>%
     ggplot(aes(x = tumor_stage, y = MeanTPM))+
     scale_y_continuous(trans = log2_trans(),
                        breaks = trans_breaks("log2", function(x) 2^x, n = 10),
                        labels = trans_format("log2", math_format(2^.x)))+
-    geom_point(aes(group = Project, color = LineColor))+
+    geom_point(aes(group = Project, color = PointColor))+
     geom_line(aes(group = interaction(Project, Symbol), color = LineColor))+
     facet_wrap(~Project, nrow = 3, ncol = 5)+
     # Label genes in the right margin
     geom_label_repel(
       aes(
-        label = ifelse((tumor_stage == "IV") & (LineColor == "red"), Symbol, ''),
+        label = ifelse(
+          (tumor_stage == "IV") & (str_detect(LineColor, "grey", negate = T)),
+          Symbol, ''),
         fill = Symbol
       ),
       fontface = 'bold', color = 'white',
@@ -136,7 +202,7 @@ for (pw in pw.list) {
       direction = "y",
       xlim = c(4, 15)
     )+
-    # Label log2 Fold Change for red ones
+    # Label log2 Fold Change for red lines
     geom_text_repel(
       aes(label = ifelse((LineColor == "red") & (!is.na(log2FoldChange)),
                          round(log2FoldChange, 2), "")),
@@ -158,6 +224,7 @@ for (pw in pw.list) {
       panel.spacing = unit(1, "in"),
       plot.margin = unit(c(0, 1, 0, 0), units = "in")
     )+
+    # scale_colour_manual(values=c("gray60", "red", "blue", "gray90"))
     scale_colour_manual(values=c("gray80", "red"))
 
   ggsave(p, file = str_glue(
