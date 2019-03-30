@@ -18,11 +18,40 @@ projects <- c(
 #   mutate(Pathway = "Proteasome") %>%
 #   select(Pathway, Symbol = external_gene_name, Ensembl = ensembl_gene_id)
 
+annot <- data.table::fread(
+  "~/CSBL_shared/ID_mapping/Ensembl_symbol_entrez.csv"
+) %>%
+  select(Ensembl = ensembl_gene_id, GeneName = external_gene_name)
+
+gangliosides <- tibble(
+  Pathway = "Ganglioside biosynthesis",
+  Symbol = c("B4GALT6", "UGCG", "ST6GAL1", "ST3GAL5", "ST3GAL2",
+             "B4GALNT1", "B3GALT4", "ST3GAL3", "ST8SIA1")
+) %>%
+  left_join(annot, by = c("Symbol" = "GeneName"))
+
+sialic.acids <- tibble(
+  Pathway = "CMP-sialic acid biosynthesis",
+  Symbol = c("GNE", "NANS", "NANP", "CMAS")
+) %>%
+  left_join(annot, by = c("Symbol" = "GeneName"))
+
 gene.list <- data.table::fread("~/storage/data/fenton/cleaned_gene_list.csv") %>%
   filter(str_detect(Pathway, "Fenton", negate = T)) %>%
-  mutate(Pathway = str_replace_all(Pathway, "[\\s/]", "_")) %>%
-  select(-PathwayType)
-# %>%  bind_rows(proteasomes)
+  select(-PathwayType) %>%
+  # bind_rows(proteasomes) %>%
+  bind_rows(gangliosides, sialic.acids) %>%
+  # Fix multiple mappings in symbol -> Ensembl
+  left_join(annot, by = "Ensembl") %>%
+  drop_na(GeneName) %>%
+  distinct() %>%
+  mutate(
+    Pathway = str_replace_all(Pathway, "[\\s/]", "_"),
+    Symbol = case_when(
+      Symbol != GeneName ~ GeneName,
+      T ~ Symbol
+    )) %>%
+  select(-GeneName)
 
 gene.mapping <- gene.list %>%
   select(-Pathway) %>%
@@ -58,7 +87,8 @@ clinical <- data.table::fread(
     T ~ "Unknown"
   )) %>%
   filter(project %in% projects) %>%
-  filter(!tumor_stage %in% c("Unknown", "Normal")) %>%
+  # filter(!tumor_stage %in% c("Unknown", "Normal")) %>%
+  filter(tumor_stage != "Unknown") %>%
   select(project, tumor_stage, barcode) %>%
   as_tibble()
 
@@ -103,10 +133,15 @@ for (proj in projects) {
     gather(key = "Barcode", value = "TPM", -Ensembl) %>%
     left_join(clinical, by = c("Barcode" = "barcode"))
 
-  # filter out lowly-expressed genes
+  sample.num <- df %>%
+    group_by(Ensembl) %>%
+    tally()
+  sample.num <- sample.num$n[1]
+  # filter out lowly-expressed genes: <0.5 in more than half the samples
   genes.to.keep <- df %>%
     group_by(Ensembl) %>%
-    filter(length(TPM >= 0.5) >= (ncol(df) / 2)) %>%
+    add_tally(TPM >= 0.5) %>%
+    filter(n > (sample.num / 2)) %>%
     distinct(Ensembl) %>%
     .$Ensembl
 
@@ -123,8 +158,12 @@ res <- res.exp %>%
   left_join(res.dea, by = c("Project" = "Project",
                             "tumor_stage" = "Stage",
                             "Symbol" = "Symbol")) %>%
-  mutate(Project = factor(Project, levels = rel.survival$Project))
-rm(res.exp, res.dea, df, genes.to.keep, t.stage, tumor.stages)
+  mutate(
+    tumor_stage = factor(tumor_stage,
+                         levels = c("Normal", "I", "II", "III", "IV")),
+    Project = factor(Project, levels = rel.survival$Project)
+  )
+rm(annot, res.exp, res.dea, df, genes.to.keep, t.stage, tumor.stages)
 pw.list <- unique(gene.list$Pathway)
 
 # Proteasome differential expression -----------------------------------------
@@ -200,7 +239,7 @@ for (pw in pw.list) {
       fontface = 'bold', color = 'white',
       segment.color = 'grey50',
       direction = "y",
-      xlim = c(4, 15)
+      xlim = c(5, 15)
     )+
     # Label log2 Fold Change for red lines
     geom_text_repel(
@@ -217,7 +256,7 @@ for (pw in pw.list) {
       y = "Average TPM"
     )+
     # Plot labels in the margins
-    coord_cartesian(xlim = c(1.5, 3.5), clip = 'off')+
+    coord_cartesian(xlim = c(1.5, 4.5), clip = 'off')+
     theme_minimal()+
     theme(
       legend.position = "none",
